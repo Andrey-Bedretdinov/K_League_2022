@@ -1,0 +1,6 @@
+service.json
+venv
+test.py
+tmp/supervisord.log
+tmp/supervisord.pid
+.idea
