@@ -2,6 +2,8 @@ import asyncio
 import configparser
 import traceback
 from multiprocessing import Process
+from pprint import pprint
+from sqlite3 import OperationalError
 from time import sleep
 from DB import DB
 from aiogram import Bot, Dispatcher, types
@@ -13,7 +15,7 @@ from google_sheets import GoogleSheets
 
 config = configparser.ConfigParser()
 config.read("config.ini")
-bot = Bot(token=config['k_league']['token'])
+bot = Bot(token=config['app']['token'])
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 dp.middleware.setup(LoggingMiddleware())
@@ -35,7 +37,7 @@ async def start(msg: types.Message):
         if not users or not (user_id in users):
             db.add_elem(table='users', values=[user_id])
             logger.debug(f'User {user_id} added to database')
-        await bot.send_message(user_id, 'Включено оповещение об обновлениях в таблице "K_League_2022 - schedule"')
+        await bot.send_message(user_id, 'Включено оповещение об обновлениях в таблице "Календарь"')
     except Exception as ex:
         logger.error(traceback.format_exc())
 
@@ -48,32 +50,62 @@ async def push_message(message):
             tasks.append(asyncio.create_task(bot.send_message(int(user), message, parse_mode='html')))
         [await task for task in tasks]
     except Exception as ex:
-        pass
+        logger.error(traceback.format_exc())
 
 
 def set_data():
-    data_google = google.get_select_data()
+    # data_google = google.sheets[1].get_all_records()
 
     try:
-        db.del_table('k_league_1')
-        db.del_table('k_league_2')
+        db.del_table(table_name)
     except:
         pass
 
     db.check(table='users', columns=['id INT'])
-    db.check(table='k_league_1', columns=['match_id INT', 'date', 'time_MSK', 'time_difference',
-                                          'time_KOR', 'team_1', 'team_2', 'link'])
-    db.check(table='k_league_2', columns=['match_id INT', 'date', 'time_MSK', 'time_difference',
-                                          'time_KOR', 'team_1', 'team_2', 'link'])
 
-    for i in range(2):
-        sheet = data_google[i]
-        sheet_name = f'k_league_{i + 1}'
-        strings = []
-        for string in sheet:
-            values = list(string.values())
-            strings.append(values)
-        db.add_elem(sheet_name, strings=strings)
+    def get_column_names(sheet):
+        return sheet.row_values(1)
+
+    column_data_types = {
+        "id": "INTEGER",
+        "tournament": "TEXT",
+        "date": "TEXT",
+        "time": "TEXT",
+        "t1": "INTEGER",
+        "t1_name": "TEXT",
+        "t2": "INTEGER",
+        "t2_name": "TEXT",
+        "uploaded_video": "TEXT",
+        "uploaded_tech": "TEXT",
+        "analysis": "TEXT",
+        "match_status": "TEXT",
+        "reviewer_comment": "TEXT",
+        "tech_link": "TEXT",
+        "report": "TEXT",
+        "platform": "TEXT"
+    }
+
+    # Создание таблицы с той же структурой, что и в Google Sheets
+    column_names = get_column_names(google.sheet)
+    column_definitions = [f"{col} {column_data_types[col]}" for col in column_names]
+
+    try:
+        db.check(table_name, columns=column_definitions)
+    except OperationalError as e:
+        print(f"Ошибка при создании таблицы: {e}")
+    #
+    # sheet = data_google
+    # strings = []
+    # for string in sheet:
+    #     strings.append({k: string[k] for k in columns_other if k in string})
+    # db.add_elem(table_name, strings=strings)
+
+
+def copy_data_to_db(sheet):
+    all_data = sheet.get_all_records()
+    for row in all_data:
+        values = list(row.values())
+        db.add_elem(table_name, values=values)
 
 
 def diff(list1, list2):
@@ -85,41 +117,39 @@ def diff(list1, list2):
 
 
 def main_loop(cfg):
-    db = DB(file=cfg['k_league']['db'])
-    google = GoogleSheets(cfg['k_league']['google_sheet'])
+    db = DB(file=cfg['app']['db'])
+    google = GoogleSheets(cfg['app']['google_sheet'])
+    logger.info('Запуск прошел успешно')
     while True:
         try:
-            data_google_ = google.get_data()
-            data_google = google.select_data(data_google_)
+            data_google = google.sheet.get_all_records()
+            data_db = db.get_data(table_name)
 
-            data_db = [db.get_data(table='k_league_1'), db.get_data(table='k_league_2')]
-
-            for i_sh in range(2):
-                sheet_google = data_google[i_sh]
-                sheet_db = data_db[i_sh]
-
-                data_diff = diff(sheet_db, sheet_google)
-                if data_diff:
-                    for i in data_diff:
-                        db.del_elem(f'k_league_{i_sh + 1}', key='match_id', value=i['match_id'])
-
-                if not sheet_google:
+            for match in data_google:
+                if match in data_db or (match['uploaded_video'] != 'да' and
+                                        match['uploaded_tech'] != 'да'):
                     continue
 
-                data_diff = diff(sheet_google, sheet_db)
-                for i in data_diff:
-                    logger.info(f'Push message {i["match_id"]}')
-                    string = data_google_[i_sh].index(i) + 2
-                    asyncio.run(push_message(f'<b>Внимание!</b> Внесены новые ссылки для скачивания\n\n'
-                                             f'<b>Table:</b> K League {i_sh + 1}   <b>String:</b> {string}\n\n'
-                                             f'<b>Match ID:</b> {i["match_id"]}\n\n'
-                                             f'<b>Home Team:</b> {i["team_1"]}\n'
-                                             f'<b>Away Team:</b> {i["team_2"]}\n'
-                                             f'<b>Date:</b> {i["date"]}\n\n'
-                                             f'<b>Video Link:</b>\n{i["link"]}'))
-                    db.add_elem(f'k_league_{i_sh + 1}', values=list(i.values()))
+                message = f'''
+<b>Внимание!</b> обновление в таблице "Календарь"
+<b>Table:</b> остальное(оффлайн)
+
+<b>Match ID:</b> {match['id']}
+
+<b>Home Team:</b> {match['t1_name']}
+<b>Away Team:</b> {match['t2_name']}
+<b>Date:</b> {match['date']}
+
+<b>Видео:</b> {match['uploaded_video']}
+<b>Техничка:</b> {match['uploaded_tech']}
+'''
+
+                asyncio.run(push_message(message=message))
+                db.add_or_replace_elem(table=table_name, row_data=match)
+                logger.success(f'Отработал матч {match}')
 
             sleep(3)
+
         except KeyboardInterrupt:
             pass
         except:
@@ -128,9 +158,14 @@ def main_loop(cfg):
 
 
 db = DB(file='server.db')
-google = GoogleSheets(config['k_league']['google_sheet'])
+google = GoogleSheets(config['app']['google_sheet'])
+table_name = 'other'
+columns_rpl = ['id', 'tournament', 'date', 't1_name', 't2_name', 'залита техничка на диск']
+columns_other = ['id', 'tournament', 'date', 't1_name', 't2_name', 'Залито видео', 'залита техничка']
 
 if __name__ == '__main__':
+    # pprint(google.sheets[0].get_all_records()[10:13])
     set_data()
-    Process(target=main_loop, args=(config, )).start()
+    copy_data_to_db(google.sheet, )
+    Process(target=main_loop, args=(config,)).start()
     executor.start_polling(dp)
